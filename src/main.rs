@@ -68,6 +68,10 @@ struct Cli {
     #[arg(short, long, default_value_t = 115_200)]
     baudrate: u32,
 
+    /// Print machine-parseable progress lines to stdout (PROGRESS:<percent>)
+    #[arg(long)]
+    progress: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -372,7 +376,20 @@ fn main() {
     };
 
     // execute command
-    let result = execute_command(&cli.command, transport.as_mut(), cli.nb_retry, cli.subsequent_timeout_ms);
+    let result = execute_command(
+        &cli.command,
+        transport.as_mut(),
+        cli.nb_retry,
+        cli.subsequent_timeout_ms,
+        cli.progress,
+    );
+
+    // Explicitly forget the transport to avoid the 2-5 second blocking delay
+    // on Linux when the serial port is dropped. On Linux, serialport's Drop
+    // implementation calls close() which blocks until the output buffer drains
+    // (tcdrain behavior). On Windows this doesn't happen.
+    // The OS will clean up the file descriptor when the process exits anyway.
+    std::mem::forget(transport);
 
     // show error, if failed
     if let Err(e) = result {
@@ -381,7 +398,13 @@ fn main() {
     }
 }
 
-fn execute_command(command: &Commands, transport: &mut dyn Transport, nb_retry: u32, subsequent_timeout_ms: u32) -> Result<(), Error> {
+fn execute_command(
+    command: &Commands,
+    transport: &mut dyn Transport,
+    nb_retry: u32,
+    subsequent_timeout_ms: u32,
+    progress: bool,
+) -> Result<(), Error> {
     match command {
         // ============== Image Management ==============
         Commands::List => {
@@ -419,9 +442,7 @@ fn execute_command(command: &Commands, transport: &mut dyn Transport, nb_retry: 
             )
         }
 
-        Commands::Test { hash, confirm } => {
-            test(transport, hex::decode(hash)?, *confirm)
-        }
+        Commands::Test { hash, confirm } => test(transport, hex::decode(hash)?, *confirm),
 
         Commands::Erase { slot } => erase(transport, *slot),
 
@@ -437,7 +458,10 @@ fn execute_command(command: &Commands, transport: &mut dyn Transport, nb_retry: 
         Commands::Taskstat => {
             let stats = taskstat(transport)?;
             println!("Task Statistics:");
-            println!("{:<24} {:>5} {:>6} {:>10} {:>10}", "Task", "Prio", "State", "Stack Use", "Stack Size");
+            println!(
+                "{:<24} {:>5} {:>6} {:>10} {:>10}",
+                "Task", "Prio", "State", "Stack Use", "Stack Size"
+            );
             println!("{}", "-".repeat(59));
             for (name, info) in stats.tasks.iter() {
                 println!(
@@ -471,7 +495,10 @@ fn execute_command(command: &Commands, transport: &mut dyn Transport, nb_retry: 
                 println!("  Mode: {} ({})", mode, mcuboot_mode_name(mode));
             }
             if let Some(no_downgrade) = info.no_downgrade {
-                println!("  Downgrade Prevention: {}", if no_downgrade { "Enabled" } else { "Disabled" });
+                println!(
+                    "  Downgrade Prevention: {}",
+                    if no_downgrade { "Enabled" } else { "Disabled" }
+                );
             }
             Ok(())
         }
@@ -505,18 +532,36 @@ fn execute_command(command: &Commands, transport: &mut dyn Transport, nb_retry: 
         }
 
         // ============== File System Management ==============
-        Commands::FsDownload { remote_path, local_path } => {
-            fs_download(transport, remote_path, local_path, subsequent_timeout_ms)
-        }
+        Commands::FsDownload {
+            remote_path,
+            local_path,
+        } => fs_download(
+            transport,
+            remote_path,
+            local_path,
+            subsequent_timeout_ms,
+            progress,
+        ),
 
-        Commands::FsUpload { local_path, remote_path } => {
-            fs_upload(transport, local_path, remote_path, subsequent_timeout_ms)
-        }
+        Commands::FsUpload {
+            local_path,
+            remote_path,
+        } => fs_upload(
+            transport,
+            local_path,
+            remote_path,
+            subsequent_timeout_ms,
+            progress,
+        ),
 
         Commands::FsStat { path } => {
             let result = fs_stat(transport, path)?;
             println!("File: {path}");
-            println!("  Size: {} ({} bytes)", format_bytes(result.len), result.len);
+            println!(
+                "  Size: {} ({} bytes)",
+                format_bytes(result.len),
+                result.len
+            );
             Ok(())
         }
 
@@ -555,7 +600,9 @@ fn execute_command(command: &Commands, transport: &mut dyn Transport, nb_retry: 
             println!("Setting '{}': {}", name, hex::encode(&result.val));
             // Try to also print as string if it's valid UTF-8
             if let Ok(s) = std::str::from_utf8(&result.val) {
-                if s.chars().all(|c| c.is_ascii_graphic() || c.is_ascii_whitespace()) {
+                if s.chars()
+                    .all(|c| c.is_ascii_graphic() || c.is_ascii_whitespace())
+                {
                     println!("  (as string): {s}");
                 }
             }
@@ -563,8 +610,8 @@ fn execute_command(command: &Commands, transport: &mut dyn Transport, nb_retry: 
         }
 
         Commands::SettingsWrite { name, value } => {
-            let bytes = hex::decode(value)
-                .map_err(|e| anyhow::anyhow!("Invalid hex value: {}", e))?;
+            let bytes =
+                hex::decode(value).map_err(|e| anyhow::anyhow!("Invalid hex value: {}", e))?;
             settings_write(transport, name, bytes)?;
             println!("Setting '{name}' written successfully");
             Ok(())
@@ -595,37 +642,40 @@ fn execute_command(command: &Commands, transport: &mut dyn Transport, nb_retry: 
         }
 
         // ============== Custom Group ==============
-        Commands::Custom { group, id, op, body } => {
+        Commands::Custom {
+            group,
+            id,
+            op,
+            body,
+        } => {
             let nmp_op = match op.as_str() {
                 "read" => NmpOp::Read,
                 "write" => NmpOp::Write,
-                _ => return Err(anyhow::anyhow!("Invalid op '{}': use 'read' or 'write'", op)),
+                _ => {
+                    return Err(anyhow::anyhow!(
+                        "Invalid op '{}': use 'read' or 'write'",
+                        op
+                    ))
+                }
             };
 
             let body_bytes = match body {
-                Some(hex_str) => hex::decode(hex_str)
-                    .map_err(|e| anyhow::anyhow!("Invalid hex body: {}", e))?,
+                Some(hex_str) => {
+                    hex::decode(hex_str).map_err(|e| anyhow::anyhow!("Invalid hex body: {}", e))?
+                }
                 None => empty_cbor_body(),
             };
 
-            let (_response_header, response_body) = transport.transceive(
-                nmp_op,
-                NmpGroup::from(*group),
-                *id,
-                &body_bytes,
-            )?;
+            let (_response_header, response_body) =
+                transport.transceive(nmp_op, NmpGroup::from(*group), *id, &body_bytes)?;
 
             println!("{}", serde_json::to_string_pretty(&response_body)?);
             Ok(())
         }
 
         Commands::HcdfInfo => {
-            let (_response_header, response_body) = transport.transceive(
-                NmpOp::Read,
-                NmpGroup::from(100),
-                0,
-                &empty_cbor_body(),
-            )?;
+            let (_response_header, response_body) =
+                transport.transceive(NmpOp::Read, NmpGroup::from(100), 0, &empty_cbor_body())?;
 
             // Pretty-print HCDF response fields
             if let serde_cbor::Value::Map(ref map) = response_body {

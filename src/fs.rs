@@ -4,6 +4,7 @@ use anyhow::{bail, Error, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 use log::{debug, info};
 use std::fs;
+use std::io::{self, Write};
 use std::path::Path;
 
 use crate::nmp_hdr::*;
@@ -13,7 +14,13 @@ use crate::util::check_rc;
 /// Download a file from the device
 ///
 /// Downloads a file from the remote path on the device to a local file.
-pub fn download(transport: &mut dyn Transport, remote_path: &str, local_path: &Path, subsequent_timeout_ms: u32) -> Result<(), Error> {
+pub fn download(
+    transport: &mut dyn Transport,
+    remote_path: &str,
+    local_path: &Path,
+    subsequent_timeout_ms: u32,
+    progress: bool,
+) -> Result<(), Error> {
     info!("download file: {} -> {}", remote_path, local_path.display());
 
     let mut file_data: Vec<u8> = Vec::new();
@@ -28,6 +35,9 @@ pub fn download(transport: &mut dyn Transport, remote_path: &str, local_path: &P
             .unwrap()
             .progress_chars("=> "),
     );
+    if progress {
+        pb.set_draw_target(indicatif::ProgressDrawTarget::hidden());
+    }
 
     loop {
         let req = FsDownloadReq {
@@ -36,14 +46,13 @@ pub fn download(transport: &mut dyn Transport, remote_path: &str, local_path: &P
         };
         let body = serde_cbor::to_vec(&req)?;
 
-        let (_response_header, response_body) = transport.transceive(
-            NmpOp::Read,
-            NmpGroup::FS,
-            NmpIdFs::File.to_u8(),
-            &body,
-        )?;
+        let (_response_header, response_body) =
+            transport.transceive(NmpOp::Read, NmpGroup::FS, NmpIdFs::File.to_u8(), &body)?;
 
-        debug!("response_body: {}", serde_json::to_string_pretty(&response_body)?);
+        debug!(
+            "response_body: {}",
+            serde_json::to_string_pretty(&response_body)?
+        );
 
         check_rc(&response_body)?;
 
@@ -63,6 +72,15 @@ pub fn download(transport: &mut dyn Transport, remote_path: &str, local_path: &P
         offset = rsp.off + rsp.data.len() as u32;
         pb.set_position(offset as u64);
 
+        // Print machine-parseable progress to stdout
+        if progress {
+            if let Some(len) = total_len {
+                let pct = (offset as f64 / len as f64) * 100.0;
+                println!("PROGRESS:{:.0}", pct);
+                let _ = io::stdout().flush();
+            }
+        }
+
         // Check if we're done
         if let Some(len) = total_len {
             if offset >= len {
@@ -80,6 +98,10 @@ pub fn download(transport: &mut dyn Transport, remote_path: &str, local_path: &P
     }
 
     pb.finish_with_message("download complete");
+    if progress {
+        println!("PROGRESS:100");
+        let _ = io::stdout().flush();
+    }
 
     // Write to local file
     fs::write(local_path, &file_data)?;
@@ -91,7 +113,13 @@ pub fn download(transport: &mut dyn Transport, remote_path: &str, local_path: &P
 /// Upload a file to the device
 ///
 /// Uploads a local file to the remote path on the device.
-pub fn upload(transport: &mut dyn Transport, local_path: &Path, remote_path: &str, subsequent_timeout_ms: u32) -> Result<(), Error> {
+pub fn upload(
+    transport: &mut dyn Transport,
+    local_path: &Path,
+    remote_path: &str,
+    subsequent_timeout_ms: u32,
+    progress: bool,
+) -> Result<(), Error> {
     info!("upload file: {} -> {}", local_path.display(), remote_path);
 
     let file_data = fs::read(local_path)?;
@@ -109,6 +137,9 @@ pub fn upload(transport: &mut dyn Transport, local_path: &Path, remote_path: &st
             .unwrap()
             .progress_chars("=> "),
     );
+    if progress {
+        pb.set_draw_target(indicatif::ProgressDrawTarget::hidden());
+    }
 
     while offset < total_len {
         // Calculate chunk size based on MTU
@@ -127,14 +158,13 @@ pub fn upload(transport: &mut dyn Transport, local_path: &Path, remote_path: &st
         };
         let body = serde_cbor::to_vec(&req)?;
 
-        let (_response_header, response_body) = transport.transceive(
-            NmpOp::Write,
-            NmpGroup::FS,
-            NmpIdFs::File.to_u8(),
-            &body,
-        )?;
+        let (_response_header, response_body) =
+            transport.transceive(NmpOp::Write, NmpGroup::FS, NmpIdFs::File.to_u8(), &body)?;
 
-        debug!("response_body: {}", serde_json::to_string_pretty(&response_body)?);
+        debug!(
+            "response_body: {}",
+            serde_json::to_string_pretty(&response_body)?
+        );
 
         check_rc(&response_body)?;
 
@@ -144,6 +174,13 @@ pub fn upload(transport: &mut dyn Transport, local_path: &Path, remote_path: &st
         offset = rsp.off;
         pb.set_position(offset as u64);
 
+        // Print machine-parseable progress to stdout
+        if progress {
+            let pct = (offset as f64 / total_len as f64) * 100.0;
+            println!("PROGRESS:{:.0}", pct);
+            let _ = io::stdout().flush();
+        }
+
         // Reduce timeout for subsequent packets
         if offset > 0 {
             transport.set_timeout(subsequent_timeout_ms)?;
@@ -151,6 +188,10 @@ pub fn upload(transport: &mut dyn Transport, local_path: &Path, remote_path: &st
     }
 
     pb.finish_with_message("upload complete");
+    if progress {
+        println!("PROGRESS:100");
+        let _ = io::stdout().flush();
+    }
     info!("uploaded {} bytes", total_len);
 
     Ok(())
@@ -165,14 +206,13 @@ pub fn stat(transport: &mut dyn Transport, path: &str) -> Result<FsStatRsp, Erro
     };
     let body = serde_cbor::to_vec(&req)?;
 
-    let (_response_header, response_body) = transport.transceive(
-        NmpOp::Read,
-        NmpGroup::FS,
-        NmpIdFs::FileStat.to_u8(),
-        &body,
-    )?;
+    let (_response_header, response_body) =
+        transport.transceive(NmpOp::Read, NmpGroup::FS, NmpIdFs::FileStat.to_u8(), &body)?;
 
-    debug!("response_body: {}", serde_json::to_string_pretty(&response_body)?);
+    debug!(
+        "response_body: {}",
+        serde_json::to_string_pretty(&response_body)?
+    );
 
     let rsp: FsStatRsp = serde_cbor::value::from_value(response_body)
         .map_err(|e| anyhow::format_err!("unexpected answer from device | {}", e))?;
@@ -202,14 +242,13 @@ pub fn hash(
     };
     let body = serde_cbor::to_vec(&req)?;
 
-    let (_response_header, response_body) = transport.transceive(
-        NmpOp::Read,
-        NmpGroup::FS,
-        NmpIdFs::FileHash.to_u8(),
-        &body,
-    )?;
+    let (_response_header, response_body) =
+        transport.transceive(NmpOp::Read, NmpGroup::FS, NmpIdFs::FileHash.to_u8(), &body)?;
 
-    debug!("response_body: {}", serde_json::to_string_pretty(&response_body)?);
+    debug!(
+        "response_body: {}",
+        serde_json::to_string_pretty(&response_body)?
+    );
 
     let rsp: FsHashRsp = serde_cbor::value::from_value(response_body)
         .map_err(|e| anyhow::format_err!("unexpected answer from device | {}", e))?;
